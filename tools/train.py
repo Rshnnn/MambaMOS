@@ -16,6 +16,11 @@ from pointcept.engines.defaults import (
 from pointcept.engines.train import TRAINERS
 from pointcept.engines.launch import launch
 
+import warnings
+
+# 抑制所有警告
+warnings.filterwarnings("ignore")
+
 
 def main_worker(cfg):
     cfg = default_setup(cfg)

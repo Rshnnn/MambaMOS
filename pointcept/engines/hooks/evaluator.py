@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import pointops
+from scipy.spatial import cKDTree
 from uuid import uuid4
 
 import pointcept.utils.comm as comm
@@ -205,6 +206,160 @@ class SemSegEvaluator(HookBase):
             "Best {}: {:.4f}".format("mIoU", self.trainer.best_metric_value)
         )
 
+@HOOKS.register_module()
+class PointCloudDenoiseEvaluator(HookBase):
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            self.eval()
+
+    def eval(self):
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.model.eval()
+        total_mse = 0
+        total_psnr = 0
+        num_samples = 0
+
+        all_denoised_points = []
+        all_clean_points = []
+        all_original_points = []
+
+        append_count = 0
+
+        for i, input_dict in enumerate(self.trainer.val_loader):
+            for key in input_dict.keys():
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                    # input_dict[key] = input_dict[key].to(device, non_blocking=True) 
+            with torch.no_grad():
+                output_dict = self.trainer.model(input_dict)
+
+            denoised_points = output_dict["seg_logits"].cpu().numpy()
+            clean_points = input_dict["segment"].cpu().numpy()
+            original_points = input_dict["feat"][:,:4].cpu().numpy()
+
+            mse, psnr = self.compute_metrics(denoised_points, clean_points)
+            # print(clean_points.shape[0])
+            total_mse += mse * clean_points.shape[0]
+            total_psnr += psnr * clean_points.shape[0]
+            num_samples += clean_points.shape[0]
+
+            self.trainer.storage.put_scalar("val_mse", mse)
+            self.trainer.storage.put_scalar("val_psnr", psnr)
+
+            info = "Test: [{iter}/{max_iter}] MSE: {mse:.4f}, PSNR: {psnr:.4f}".format(
+                iter=i + 1, max_iter=len(self.trainer.val_loader), mse=mse, psnr=psnr
+            )
+            self.trainer.logger.info(info)
+
+            # Accumulate points for later visualization
+            if append_count < 1:
+                all_denoised_points.append(denoised_points)
+                all_clean_points.append(clean_points)
+                all_original_points.append(original_points)
+                append_count += 1
+
+
+        avg_mse = total_mse / num_samples
+        avg_psnr = total_psnr / num_samples
+
+        self.trainer.logger.info(
+            "Val result: Avg MSE: {:.4f}, Avg PSNR: {:.4f}".format(avg_mse, avg_psnr)
+        )
+
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("val/mse", avg_mse, current_epoch)
+            self.trainer.writer.add_scalar("val/psnr", avg_psnr, current_epoch)
+
+        # if torch.cuda.device_count() > 1:
+        #     self.trainer.model = torch.nn.DataParallel(self.trainer.model)
+
+        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+        self.trainer.comm_info["current_metric_value"] = avg_psnr  # save for saver
+        self.trainer.comm_info["current_metric_name"] = "PSNR"  # save for saver
+
+        # After all batches, visualize aggregated points
+        all_denoised_points = np.concatenate(all_denoised_points, axis=0)
+        all_clean_points = np.concatenate(all_clean_points, axis=0)
+        all_original_points = np.concatenate(all_original_points, axis=0)
+
+        # Visualize aggregated points
+        self.visualize_points(all_original_points, "aggregated_original_points")
+        self.visualize_points(all_denoised_points, "aggregated_denoised_points")
+        self.visualize_points(all_clean_points, "aggregated_clean_points")
+        
+        '''
+        def compute_metrics(self, denoised_points, clean_points):
+            # Use KDTree for nearest neighbor search
+            tree = cKDTree(clean_points[:, :3])
+            dist, idx = tree.query(denoised_points[:, :3])
+
+            # Compute MSE
+            mse = np.mean(dist ** 2)
+
+            # Compute PSNR
+            psnr = 20 * np.log10(1.0 / np.sqrt(mse))
+
+            return mse, psnr
+        '''
+
+    def compute_metrics(self, denoised_points, clean_points):
+        
+        tree = cKDTree(clean_points[:, :3])
+        dist, _ = tree.query(denoised_points[:, :3], k=1)
+        mse = np.mean(dist ** 2)
+        clean_mean = np.mean(clean_points[:, :3], axis=0)
+        nmse = mse / np.mean(np.sum((clean_points[:, :3] - clean_mean) ** 2, axis=1))
+        psnr = 20 * np.log10(1.0 / np.sqrt(mse)) if mse > 0 else float('inf')
+        return nmse, psnr
+
+    def render(self, x, y, t, p, shape):
+        # print(f"x shape: {x.shape}, y shape: {y.shape}")
+        # print(f"x values: {x[:10]}, y values: {y[:10]}") 
+        p = (p > 0).astype(int)
+        img = np.full(shape=tuple(shape) + (3,), fill_value=255, dtype="uint8")
+        img[y, x, :] = 0
+        img[y, x, p] = 255
+        return img
+    
+    def visualize_points(self, points, tag):
+        # Extract x, y, z, and p from the points
+        x, y, _, p = points[:, 0], points[:, 1], points[:, 2], points[:, 3]
+        # Scale and convert to integer
+        # Find the range of x and y
+        x_min, x_max = x.min(), x.max()
+        y_min, y_max = y.min(), y.max()
+        # print(tag, x_min, x_max, y_min, y_max)
+        
+        # Normalize x and y to the range [0, 460] and [0, 352]
+        # x = ((x - x_min) / (x_max - x_min) * 460).astype(int)
+        # y = ((y - y_min) / (y_max - y_min) * 352).astype(int)
+        x = (np.clip(x, 0, 1) * self.trainer.cfg.event_size[0]).astype(int)
+        y = (np.clip(y, 0, 1) * self.trainer.cfg.event_size[1]).astype(int)
+        
+        # Filter out points that are out of bounds (should not happen after normalization)
+        # valid_mask = (x >= 0) & (x < 460) & (y >= 0) & (y < 352)
+        valid_mask = (x >= 0) & (x < self.trainer.cfg.event_size[0]) & (y >= 0) & (y < self.trainer.cfg.event_size[1])
+        x = x[valid_mask]
+        y = y[valid_mask]
+        p = p[valid_mask]
+        
+        # Assuming z-coordinate is binary (1 or -1) for visualization
+        # img = self.render(x, y, None, p, (352, 460))
+        img = self.render(x, y, None, p, (self.trainer.cfg.event_size[1], self.trainer.cfg.event_size[0]))
+
+
+        img = img.astype(np.uint8)
+        img = np.transpose(img, (2, 0, 1))
+
+        # Add image to the writer
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_image(tag, img, self.trainer.epoch + 1)
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.4f}".format("PSNR", self.trainer.best_metric_value)
+        )
 
 @HOOKS.register_module()
 class InsSegEvaluator(HookBase):

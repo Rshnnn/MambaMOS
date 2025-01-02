@@ -8,6 +8,9 @@ os.environ["OPT"] = " ".join(
     flag for flag in opt.split() if flag != "-Wstrict-prototypes"
 )
 
+os.environ["CC"] = "gcc-6"
+os.environ["CXX"] = "g++-6"
+
 src = "src"
 sources = [
     os.path.join(root, file)

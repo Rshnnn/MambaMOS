@@ -7,6 +7,7 @@ Please cite our work if the code is helpful to you.
 
 import os
 import numpy as np
+import re
 
 import random
 
@@ -78,6 +79,8 @@ class SemanticKITTIMultiScansDataset(DefaultMultiScansDataset):
         self,
         split="train",
         data_root="data",
+        data_width = 460,
+        data_height = 352,
         gather_num=6,
         scan_modulation=False,
         transform=None,
@@ -88,6 +91,8 @@ class SemanticKITTIMultiScansDataset(DefaultMultiScansDataset):
         ignore_index=-1,
     ):
         self.gather_num = gather_num
+        self.data_width = data_width
+        self.data_height = data_height
         self.scan_modulation = scan_modulation
         self.ignore_index = ignore_index
         self.learning_map = self.get_learning_map(ignore_index)
@@ -143,11 +148,13 @@ class SemanticKITTIMultiScansDataset(DefaultMultiScansDataset):
 
     def get_data_list(self):
         split2seq = dict(
-            train=[0, 1, 2, 3, 4, 5, 6, 7, 9, 10],
-            val=[8],
-            test=[11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
-            road_train=[30, 31, 32, 33, 34, 40],
-            road_test=[35, 36, 37, 38, 39, 41],
+            # train=[1, 10, 15, 17, 25, 40, 75, 80, 100, 125, 175, 200],
+            # val=[50],
+            # test=[5, 20, 30, 60, 150],
+            train=[1, 3],
+            val=[2],
+            test=[4],
+
         )
         if isinstance(self.split, str):
             seq_list = split2seq[self.split]
@@ -162,25 +169,15 @@ class SemanticKITTIMultiScansDataset(DefaultMultiScansDataset):
         self.poses = {}
         pending_dict = self.filter_dataset(seq_list)
         for seq in seq_list:
-            seq = str(seq).zfill(2)
+            seq = f"rain_{seq}"
+            # seq = str(seq)+"mm"
             # seq_folder = os.path.join(self.data_root, "dataset", "sequences", seq)
-            seq_folder = os.path.join(self.data_root, "sequences", seq)
-            seq_pose_file = os.path.join(seq_folder, "poses.txt")
-            seq_calib_file = os.path.join(seq_folder, "calib.txt")
-
-            self.poses[seq] = self.get_pose_data(pose_file=seq_pose_file, calib_file=seq_calib_file)
-
+            seq_folder = os.path.join(self.data_root,  "merge_data")
             if self.split == "train":
-                data_list += absoluteFilePaths(os.path.join(seq_folder, "velodyne"), selected_file_list=pending_dict[seq])
-                print(f"Filter few static frame --- Seq {seq} drops "
-                      f"{len(os.listdir(os.path.join(seq_folder, 'velodyne'))) - len(pending_dict[seq])} : "
-                      f"{len(os.listdir(os.path.join(seq_folder, 'velodyne')))} -> {len(pending_dict[seq])}")
+                data_list += absoluteFilePaths(os.path.join(seq_folder, seq))
+                print(f"Processing all frames in Seq {seq} without filtering.")
             else:
-                data_list += absoluteFilePaths(os.path.join(seq_folder, "velodyne"))
-            # seq_files = sorted(os.listdir(os.path.join(seq_folder, "velodyne")))
-            # data_list += [
-            #     os.path.join(seq_folder, "velodyne", file) for file in seq_files
-            # ]
+                data_list += absoluteFilePaths(os.path.join(seq_folder, seq))
         return data_list
 
     def get_multi_data(self, idx):
@@ -188,12 +185,10 @@ class SemanticKITTIMultiScansDataset(DefaultMultiScansDataset):
 
         multi_scan_path, gather_coord, gather_strength, gather_segment = [], [], [], []
         seq, _, file_name = cur_data_path.split('/')[-3:]
-        gather_seq = [seq for _ in range(self.gather_num)]
 
         cur_scan_index = int(file_name.split('.')[0])
 
         tn = []
-
         modulation = 1
         if self.scan_modulation:
             scan_modulation_prob = random.random()
@@ -204,38 +199,72 @@ class SemanticKITTIMultiScansDataset(DefaultMultiScansDataset):
             if self.split != "train":
                 modulation = 3
 
-        for i, seq in enumerate(gather_seq):
+        for i in range(self.gather_num):
             last_scan_index = cur_scan_index - modulation * i
-            last_scan_index = max(0, last_scan_index)  # 5, 4, 3, 2, 1, 0, 0, 0
-            scan_path = cur_data_path.replace(cur_data_path.split("/")[-1], str(last_scan_index).zfill(6) + ".bin")
+            last_scan_index = max(0, last_scan_index)
+            scan_path = cur_data_path.replace(cur_data_path.split("/")[-1], f"{str(last_scan_index).zfill(10)}.npz")
+            if not os.path.exists(scan_path):
+                print(f"File {scan_path} does not exist, skipping...")
+                continue
 
-            with open(scan_path, "rb") as b:
-                scan = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
+            # 读取 `.npz` 数据
+            with np.load(scan_path) as data:
+                x = data['x'] 
+                y = data['y'] 
+                t = data['t']
+                p = data['p']
 
-                coord = points_transform(scan[:, :3], from_pose=self.poses[seq][last_scan_index],
-                                         to_pose=self.poses[seq][cur_scan_index])
+                # 构建 coord 和 strength
+                coord = np.stack((x, y, t), axis=-1)
+                strength = p.reshape(-1, 1)
+            # print(f"coord: {coord.shape}, strength: {strength.shape}")
+            # 读取 segment 数据
+            segment_path = scan_path.replace("merge_data", "raw_data")
+            segment_path = re.sub(r"/rain_\d+/", "/", segment_path)
+            # segment_path = re.sub(r"/\d+mm/", "/", segment_path)
+            # print(f"segment_path: {segment_path}")
+            if os.path.exists(segment_path):
+                with np.load(segment_path) as segment_data:
+                    segment_x = segment_data['x'] 
+                    segment_y = segment_data['y'] 
+                    segment_t = segment_data['t']
+                    segment_p = segment_data['p']
 
-            strength = scan[:, -1].reshape([-1, 1])
+                    # 归一化 segment_t
+                    segment_t_normalized = (segment_t - segment_t.min()) / (segment_t.max() - segment_t.min())
 
-            label_file = scan_path.replace("velodyne", "labels").replace(".bin", ".label")
-            if os.path.exists(label_file):
-                with open(label_file, "rb") as a:
-                    segment = np.fromfile(a, dtype=np.int32).reshape(-1) & 0xFFFF
-                    segment = np.vectorize(self.learning_map.__getitem__)(
-                        segment
-                    ).astype(np.int32)
+                    # 构建 segment
+                    segment = np.stack((segment_x, segment_y, segment_t_normalized, segment_p), axis=-1)
+                    # print(f"segment shape: {segment.shape}")
+
             else:
-                segment = np.zeros(scan.shape[0]).astype(np.int32)
+                print(f"segment_path: {segment_path}")
+                segment = np.zeros(coord.shape).astype(np.float32)
+                # print(f")))))))Processing segment: {segment.shape}")
+            # 归一化时间 t
+            t_normalized = (t - t.min()) / (t.max() - t.min())  # 归一化 t 到 [0, 1] 范围
 
+            # 将归一化的时间 t 添加到 coord 中
+            coord = np.column_stack((x, y, t_normalized))  # 组合 (x, y, t_normalized)
+
+            # 添加时间窗口索引
+            # print(f"Processing scan file: {scan_path}")
+            tn.append(np.ones(coord.shape[0]) * i)  # i 为窗口索引
+
+            # 聚合当前文件的数据
             gather_coord.append(coord)
             gather_strength.append(strength)
             gather_segment.append(segment)
-
             multi_scan_path.append(scan_path)
-            tn.append(np.ones_like(segment) * i)
 
+        # print(gather_coord.shape)
+        # print(gather_coord)
+        # print(gather_coord[0])
+        # print(gather_coord[4])
+        # print(gather_coord[5])
+        # print(gather_segment.shape)
         data_dict = dict(coord=np.concatenate(gather_coord), strength=np.concatenate(gather_strength),
-                         segment=np.concatenate(gather_segment), tn=np.expand_dims(np.concatenate(tn), axis=1))
+                        segment=np.concatenate(gather_segment), tn=np.expand_dims(np.concatenate(tn), axis=1))
 
         return data_dict
 
@@ -247,6 +276,7 @@ class SemanticKITTIMultiScansDataset(DefaultMultiScansDataset):
         coord = scan[:, :3]
         strength = scan[:, -1].reshape([-1, 1])
 
+        '''     
         label_file = data_path.replace("velodyne", "labels").replace(".bin", ".label")
         if os.path.exists(label_file):
             with open(label_file, "rb") as a:
@@ -256,6 +286,14 @@ class SemanticKITTIMultiScansDataset(DefaultMultiScansDataset):
                 ).astype(np.int32)
         else:
             segment = np.zeros(scan.shape[0]).astype(np.int32)
+        '''
+
+        segment_path = data_path.replace("velodyne", "segments").replace(".bin", ".segment")
+        if os.path.exists(segment_path):
+            with open(segment_path, "rb") as a:
+                segment = np.fromfile(a, dtype=np.float32).reshape(-1, 4)
+        else:
+            segment = np.zeros(scan.shape).astype(np.float32)
 
         data_dict = dict(coord=coord, strength=strength, segment=segment)
         return data_dict
