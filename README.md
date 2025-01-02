@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <p align="center">
 <h1 align="center"><strong>MambaMOS: LiDAR-based 3D Moving Object Segmentation with Motion-aware State Space Model</strong></h1>
 <h3 align="center">ACM MM 2024</h3>
@@ -129,3 +130,6 @@ Thanks a lot :)
 ## Acknowledgement
 The code framework of this project is based on [pointcept](https://github.com/Pointcept/Pointcept), 
 and the code of _MambaMOS_ and _MSSM_ refers to [PTv3](https://github.com/Pointcept/PointTransformerV3) and [mamba](https://github.com/state-spaces/mamba) respectively, thanks to their excellent work.
+=======
+# test
+>>>>>>> 1f4bb549ebc998c79e8079df985e33b729838b59
