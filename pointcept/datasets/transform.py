@@ -250,6 +250,11 @@ class RandomRotate(object):
             data_dict["coord"] -= center
             data_dict["coord"] = np.dot(data_dict["coord"], np.transpose(rot_t))
             data_dict["coord"] += center
+
+            data_dict["segment"][:, :3] -= center
+            data_dict["segment"][:, :3] = np.dot(data_dict["segment"][:, :3], np.transpose(rot_t))
+            data_dict["segment"][:, :3] += center
+
         if "normal" in data_dict.keys():
             data_dict["normal"] = np.dot(data_dict["normal"], np.transpose(rot_t))
         return data_dict
@@ -306,6 +311,7 @@ class RandomScale(object):
                 self.scale[0], self.scale[1], 3 if self.anisotropic else 1
             )
             data_dict["coord"] *= scale
+            data_dict["segment"][:, :3] *= scale
         return data_dict
 
 
@@ -318,11 +324,13 @@ class RandomFlip(object):
         if np.random.rand() < self.p:
             if "coord" in data_dict.keys():
                 data_dict["coord"][:, 0] = -data_dict["coord"][:, 0]
+                data_dict["segment"][:, 0] = -data_dict["segment"][:, 0]
             if "normal" in data_dict.keys():
                 data_dict["normal"][:, 0] = -data_dict["normal"][:, 0]
         if np.random.rand() < self.p:
             if "coord" in data_dict.keys():
                 data_dict["coord"][:, 1] = -data_dict["coord"][:, 1]
+                data_dict["segment"][:, 1] = -data_dict["segment"][:, 1]
             if "normal" in data_dict.keys():
                 data_dict["normal"][:, 1] = -data_dict["normal"][:, 1]
         return data_dict
@@ -343,6 +351,8 @@ class RandomJitter(object):
                 self.clip,
             )
             data_dict["coord"] += jitter
+            data_dict["segment"][:, :3] += jitter
+            # print(f"Segment shape after jitter: {data_dict['segment'].shape}")
         return data_dict
 
 
@@ -840,17 +850,36 @@ class GridSample(object):
             if self.return_displacement:
                 displacement = (
                     scaled_coord - grid_coord - 0.5
-                )  # [0, 1] -> [-0.5, 0.5] displacement to center
+                )  
                 if self.project_displacement:
                     displacement = np.sum(
                         displacement * data_dict["normal"], axis=-1, keepdims=True
                     )
                 data_dict["displacement"] = displacement[idx_unique]
             for key in self.keys:
-                data_dict[key] = data_dict[key][idx_unique]
+                if key == "segment":
+                    # 针对 GT 单独处理，确保与 coord 对齐
+                    # pass
+                    scaled_gt_coord = data_dict["segment"] / np.array(self.grid_size)
+                    grid_gt_coord = np.floor(scaled_gt_coord).astype(int)
+                    min_gt_coord = grid_gt_coord.min(0)
+                    grid_gt_coord -= min_gt_coord
+                    key_gt = self.hash(grid_gt_coord)
+                    idx_sort_gt = np.argsort(key_gt)
+                    key_sort_gt = key_gt[idx_sort_gt]
+                    _, inverse_gt, count_gt = np.unique(
+                        key_sort_gt, return_inverse=True, return_counts=True
+                    )
+                    a_gt = np.cumsum(np.insert(count_gt, 0, 0)[0:-1])
+                    b_gt = np.random.randint(0, count_gt.max(), count_gt.size)
+                    idx_unique_gt = idx_sort_gt[(a_gt + b_gt % count_gt)]
+                    data_dict[key] = data_dict[key][idx_unique_gt]
+                else:
+                    data_dict[key] = data_dict[key][idx_unique]
 
             return data_dict
-        elif self.mode == "test":  # test mode
+        elif self.mode == "test": 
+            # test mode
             data_part_list = []
             for i in range(count.max()):
                 idx_select = np.cumsum(np.insert(count, 0, 0)[0:-1]) + i % count
@@ -866,7 +895,7 @@ class GridSample(object):
                 if self.return_displacement:
                     displacement = (
                         scaled_coord - grid_coord - 0.5
-                    )  # [0, 1] -> [-0.5, 0.5] displacement to center
+                    ) # [0, 1] -> [-0.5, 0.5] displacement to center
                     if self.project_displacement:
                         displacement = np.sum(
                             displacement * data_dict["normal"], axis=-1, keepdims=True
@@ -875,10 +904,44 @@ class GridSample(object):
                 for key in data_dict.keys():
                     if key in self.keys:
                         data_part[key] = data_dict[key][idx_part]
+                    elif key == "segment":
+                        idx_select_gt = np.cumsum(np.insert(count_gt, 0, 0)[0:-1]) + i % count_gt
+                        idx_part_gt = idx_sort[idx_select_gt]
+                        data_part = dict(index=idx_part_gt)
+                        data_part[key] = data_dict[key][idx_part_gt]
                     else:
                         data_part[key] = data_dict[key]
                 data_part_list.append(data_part)
             return data_part_list
+        # elif self.mode == "test":  # test mode
+        #     data_part_list = []
+        #     for i in range(count.max()):
+        #         idx_select = np.cumsum(np.insert(count, 0, 0)[0:-1]) + i % count
+        #         idx_part = idx_sort[idx_select]
+        #         data_part = dict(index=idx_part)
+        #         if self.return_inverse:
+        #             data_dict["inverse"] = np.zeros_like(inverse)
+        #             data_dict["inverse"][idx_sort] = inverse
+        #         if self.return_grid_coord:
+        #             data_part["grid_coord"] = grid_coord[idx_part]
+        #         if self.return_min_coord:
+        #             data_part["min_coord"] = min_coord.reshape([1, 3])
+        #         if self.return_displacement:
+        #             displacement = (
+        #                 scaled_coord - grid_coord - 0.5
+        #             )  # [0, 1] -> [-0.5, 0.5] displacement to center
+        #             if self.project_displacement:
+        #                 displacement = np.sum(
+        #                     displacement * data_dict["normal"], axis=-1, keepdims=True
+        #                 )
+        #             data_dict["displacement"] = displacement[idx_part]
+        #         for key in data_dict.keys():
+        #             if key in self.keys:
+        #                 data_part[key] = data_dict[key][idx_part]
+        #             else:
+        #                 data_part[key] = data_dict[key]
+        #         data_part_list.append(data_part)
+        #     return data_part_list
         else:
             raise NotImplementedError
 
@@ -930,6 +993,11 @@ class SphereCrop(object):
     def __call__(self, data_dict):
         point_max = (
             int(self.sample_rate * data_dict["coord"].shape[0])
+            if self.sample_rate is not None
+            else self.point_max
+        )
+        point_max_segment = (
+            int(self.sample_rate * data_dict["segment"].shape[0])
             if self.sample_rate is not None
             else self.point_max
         )
@@ -1007,7 +1075,8 @@ class SphereCrop(object):
             if "normal" in data_dict.keys():
                 data_dict["normal"] = data_dict["normal"][idx_crop]
             if "segment" in data_dict.keys():
-                data_dict["segment"] = data_dict["segment"][idx_crop]
+                idx_crop_segment = np.argsort(np.sum(np.square(data_dict["segment"][:, :3] - center), 1))[:point_max_segment]
+                data_dict["segment"] = data_dict["segment"][idx_crop_segment]
             if "instance" in data_dict.keys():
                 data_dict["instance"] = data_dict["instance"][idx_crop]
             if "displacement" in data_dict.keys():
@@ -1145,4 +1214,40 @@ class Compose(object):
     def __call__(self, data_dict):
         for t in self.transforms:
             data_dict = t(data_dict)
+        return data_dict
+    
+
+@TRANSFORMS.register_module()
+class Normalize(object):
+    def __init__(self, resolution=[460, 352]):
+        """
+        初始化归一化类。
+
+        Args:
+            dims (tuple): 需要归一化的维度索引。
+        """
+        self.resolution = resolution
+
+    def __call__(self, data_dict):
+        """
+        对 data_dict["coord"] 和 data_dict["segment"] 的前几个维度进行归一化。
+
+        Args:
+            data_dict (dict): 包含 "coord" 和 "segment" 的数据字典。
+
+        Returns:
+            dict: 归一化后的数据字典。
+        """
+        if "coord" in data_dict.keys():
+            coord = data_dict["coord"]
+            coord[:, 0] /= self.resolution[0]
+            coord[:, 1] /= self.resolution[1]
+            data_dict["coord"] = coord
+
+        if "segment" in data_dict.keys():
+            segment = data_dict["segment"]
+            segment[:, 0] /= self.resolution[0]
+            segment[:, 1] /= self.resolution[1]
+            data_dict["segment"] = segment
+
         return data_dict

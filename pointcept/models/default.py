@@ -43,23 +43,23 @@ class DefaultSegmentorV2(nn.Module):
         criteria=None,
     ):
         super().__init__()
-        self.seg_head = (
-            nn.Linear(backbone_out_channels, num_classes)
-            if num_classes > 0
-            else nn.Identity()
-        )
+        self.seg_head = nn.Sequential(
+            nn.Linear(backbone_out_channels, num_classes),
+            # nn.Sigmoid()
+            ) if num_classes > 0 else nn.Identity()
         self.backbone = build_model(backbone)
         self.criteria = build_criteria(criteria)
 
     def forward(self, input_dict):
-        point = Point(input_dict)
-        point = self.backbone(point)
-        seg_logits = self.seg_head(point.feat)
-        # train
+        point_0 = Point(input_dict)
+        point_1 = self.backbone(point_0)
+        seg_logits_0 = self.seg_head(point_1.feat)
+        seg_logits = point_0.feat[:,:4]-seg_logits_0
+
         if self.training:
             loss = self.criteria(seg_logits, input_dict["segment"])
             return dict(loss=loss)
-        # eval
+        # evals
         elif "segment" in input_dict.keys():
             loss = self.criteria(seg_logits, input_dict["segment"])
             return dict(loss=loss, seg_logits=seg_logits)
@@ -67,40 +67,6 @@ class DefaultSegmentorV2(nn.Module):
         else:
             return dict(seg_logits=seg_logits)
 
-# @MODELS.register_module()
-# class DefaultSegmentorDeepOdlLoss(nn.Module):
-#     def __init__(
-#         self,
-#         num_classes,
-#         backbone_out_channels,
-#         backbone=None,
-#         criteria=None,
-#     ):
-#         super().__init__()
-#         self.seg_head = (
-#             nn.Linear(backbone_out_channels, 4)
-#             if num_classes > 0
-#             else nn.Identity()
-#         )
-#         self.backbone = build_model(backbone)
-#         self.criteria = build_criteria(criteria)
-#
-#     def forward(self, input_dict):
-#         point = Point(input_dict)
-#         point = self.backbone(point)
-#         seg_logits = self.seg_head(point.feat)
-#
-#         # train
-#         if self.training:
-#             loss = self.criteria(seg_logits, input_dict["segment"])
-#             return dict(loss=loss)
-#         # eval
-#         elif "segment" in input_dict.keys():
-#             loss = self.criteria(seg_logits, input_dict["segment"])
-#             return dict(loss=loss, seg_logits=seg_logits)
-#         # test
-#         else:
-#             return dict(seg_logits=seg_logits)
 
 @MODELS.register_module()
 class DefaultClassifier(nn.Module):

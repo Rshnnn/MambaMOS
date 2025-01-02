@@ -13,7 +13,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils.data
-
+from scipy.spatial import cKDTree
+from torch.utils.tensorboard import SummaryWriter
 from .defaults import create_ddp_model
 import pointcept.utils.comm as comm
 from pointcept.datasets import build_dataset, collate_fn
@@ -541,3 +542,236 @@ class PartSegTester(TesterBase):
     @staticmethod
     def collate_fn(batch):
         return collate_fn(batch)
+
+
+@TESTERS.register_module()
+class PointDenoiseTester(TesterBase):
+    def __init__(self, cfg, model=None, test_loader=None, verbose=False):
+        super().__init__(cfg, model=model, test_loader=test_loader, verbose=verbose)
+        # Initialize TensorBoard writer
+        self.writer = SummaryWriter(log_dir=os.path.join(cfg.save_path, 'testlogs'))        
+    
+    def render(self, x, y, t, p, shape):
+        # Render a 2D image from the point cloud coordinates (x, y) and labels (p)
+        p = (p > 0).astype(int)
+        img = np.full(shape=tuple(shape) + (3,), fill_value=255, dtype="uint8")
+        img[y, x, :] = 0
+        img[y, x, p] = 255
+        return img
+
+    def visualize_points(self, points, tag, idx):
+        # Extract x, y, z, and p from the points
+        x, y, _, p = points[:, 0], points[:, 1], points[:, 2], points[:, 3]
+        
+        # Normalize x and y to the range [0, 460] and [0, 352]
+        # x_min, x_max = x.min(), x.max()
+        # y_min, y_max = y.min(), y.max()
+        if(tag == "segment"):
+            x = x.astype(int)
+            y = y.astype(int)
+        else:
+            # x = (np.clip(x, 0, 1) * 460).astype(int)
+            # y = (np.clip(y, 0, 1) * 352).astype(int)
+            x = (np.clip(x, 0, 1) * self.cfg.event_size[0]).astype(int)
+            y = (np.clip(y, 0, 1) * self.cfg.event_size[1]).astype(int)
+            
+
+        # print(f"X min: {x_min}, X max: {x_max}")
+        # print(f"Y min: {y_min}, Y max: {y_max}")
+        
+        # # Normalize the coordinates to fit within the image size (460, 352)
+        # x = ((x - x_min) / (x_max - x_min) * 460).astype(int)
+        # y = ((y - y_min) / (y_max - y_min) * 352).astype(int)
+        
+        # Filter out points that are out of bounds (should not happen after normalization)
+        # valid_mask = (x >= 0) & (x < 460) & (y >= 0) & (y < 352)
+        valid_mask = (x >= 0) & (x < self.cfg.event_size[0]) & (y >= 0) & (y < self.cfg.event_size[1])
+        x = x[valid_mask]
+        y = y[valid_mask]
+        p = p[valid_mask]
+        
+        # Render the points into an image
+        # img = self.render(x, y, None, p, (352, 460))
+        img = self.render(x, y, None, p, (self.cfg.event_size[1], self.cfg.event_size[0]))
+
+        img = img.astype(np.uint8)
+        img = np.transpose(img, (2, 0, 1))  # Convert to (C, H, W) format for TensorBoard
+
+        # Add image to the TensorBoard writer
+        if self.writer is not None:
+            self.writer.add_image(tag, img, idx)
+
+    def compute_metrics(self, denoised_points, clean_points):
+        # Use KDTree for nearest neighbor search
+        # print(f"Denoised points shape: {denoised_points.shape}")
+        # print(f"Clean points shape: {clean_points.shape}")
+        tree = cKDTree(clean_points[:, :3])
+        dist, idx = tree.query(denoised_points[:, :3])
+
+        # Compute MSE
+        mse = np.mean(dist ** 2)
+
+        # Compute PSNR
+        psnr = 20 * np.log10(1.0 / np.sqrt(mse))
+
+        return {"mse": mse.item(), "psnr": psnr.item()}
+    '''
+    def compute_metrics(self, pred, target, mask=None):
+        """
+        计算去噪任务的指标：均方误差（MSE）和信噪比（SNR）。
+        
+        Args:
+            pred: 模型预测的输出，形状为 (batch_size, channels, height, width)。
+            target: 目标图像，形状与 pred 相同。
+            mask: 可选掩码，选择有效区域的布尔数组。
+        
+        Returns:
+            dict: 包含 MSE 和 SNR 的字典。
+        """
+        if mask is not None:
+            pred = pred[mask]
+            target = target[mask]
+
+        # 均方误差 (MSE)
+        mse = F.mse_loss(pred, target)
+
+        # 信噪比 (SNR)
+        signal_power = torch.mean(target ** 2)
+        noise_power = torch.mean((pred - target) ** 2)
+        snr = 10 * torch.log10(signal_power / (noise_power + 1e-10))
+
+        return {"mse": mse.item(), "snr": snr.item()}
+    '''
+
+    def test(self):
+        assert self.test_loader.batch_size == 1
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+
+        batch_time = AverageMeter()
+        mse_meter = AverageMeter()
+        psnr_meter = AverageMeter()
+        self.model.eval()
+
+        save_path = os.path.join(self.cfg.save_path, "result")
+        make_dirs(save_path)
+
+        record = {}
+
+        for idx, data_dict in enumerate(self.test_loader):
+            end = time.time()
+            data_dict = data_dict[0]  # 当前假设 batch size 为 1
+            fragment_list = data_dict.pop("fragment_list")
+            segment = data_dict.pop("segment")
+            data_name = data_dict.pop("name")
+
+            tn = data_dict.pop("tn")
+            final_scan_mask = tn.squeeze(1) == 0
+
+            pred_save_path = os.path.join(save_path, "{}.npy".format(data_name))
+
+            pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
+
+            for i in range(len(fragment_list)):
+                fragment_batch_size = 1
+                s_i, e_i = i * fragment_batch_size, min(
+                    (i + 1) * fragment_batch_size, len(fragment_list)
+                )
+                input_dict = collate_fn(fragment_list[s_i:e_i])
+                for key in input_dict.keys():
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                idx_part = input_dict["index"]
+                with torch.no_grad():
+                    start_forward_time = time.time()
+                    pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
+                    end_forward_time = time.time()
+                    forward_time = end_forward_time - start_forward_time
+                    print(f"Forward time: {forward_time* 1000}")
+                    if self.cfg.empty_cache:
+                        torch.cuda.empty_cache()
+                    bs = 0
+                    for be in input_dict["offset"]:
+                        pred[idx_part[bs:be], :] += pred_part[bs:be]
+                        bs = be
+
+                logger.info(
+                    "Test: {}/{}-{data_name}, Batch: {batch_idx}/{batch_num}".format(
+                        idx + 1,
+                        len(self.test_loader),
+                        data_name=data_name,
+                        batch_idx=i+1,
+                        batch_num=len(fragment_list),
+                    )
+                )
+            pred = pred.data.cpu().numpy()
+
+            if "origin_segment" in data_dict.keys():
+                assert "inverse" in data_dict.keys()
+                pred = pred[data_dict["inverse"]]
+                segment = data_dict["origin_segment"]
+                tn = data_dict["origin_tn"]
+
+
+            # 计算去噪指标
+            metrics = self.compute_metrics(pred, segment)
+            mse_meter.update(metrics["mse"])
+            psnr_meter.update(metrics["psnr"])
+
+            logger.info(
+                "Test: {}/{}-{} "
+                "Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) "
+                "MSE {mse:.4f} ({mse_avg:.4f}) "
+                "PSNR {psnr:.2f} ({psnr_avg:.2f}) ".format(
+                    idx + 1,
+                    len(self.test_loader),
+                    data_name,
+                    batch_time=batch_time,
+                    mse=metrics["mse"],
+                    mse_avg=mse_meter.avg,
+                    psnr=metrics["psnr"],
+                    psnr_avg=psnr_meter.avg,
+                )
+            )
+            # Log MSE and PSNR to TensorBoard
+            self.writer.add_scalar(f"Test/{data_name}/MSE", metrics["mse"], idx)
+            self.writer.add_scalar(f"Test/{data_name}/PSNR", metrics["psnr"], idx)
+            
+            # Visualize and log the points (original, denoised, and clean)
+            original_points = input_dict["feat"][:, :4].cpu().numpy()
+            # print(f"Original points: {original_points.shape}")
+            # print(f"Pred points: {pred.shape}")
+            # print(f"Segment points: {segment.shape}")
+            self.visualize_points(original_points, "original",idx)
+            self.visualize_points(pred, "pred",idx)
+            self.visualize_points(segment, "segment",idx)
+
+
+            # 保存预测结果
+            pred_save_path = os.path.join(save_path, f"{data_name}_pred.npy")
+            np.save(pred_save_path, pred)
+
+            # segment_save_path = os.path.join(save_path, f"{data_name}_segment.npy")
+            # np.save(segment_save_path, segment)
+            record[data_name] = metrics
+
+            batch_time.update(time.time() - end)
+            # break
+
+        logger.info("Syncing ...")
+        comm.synchronize()
+
+        # 打印最终结果
+        logger.info(
+            "Final result: "
+            "MSE: {:.4f}, SNR: {:.2f}".format(
+                mse_meter.avg, psnr_meter.avg
+            )
+        )
+
+        logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+        return record
+    
+    @staticmethod
+    def collate_fn(batch):
+        return batch

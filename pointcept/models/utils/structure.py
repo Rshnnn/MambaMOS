@@ -46,7 +46,16 @@ class Point(Dict):
             self["offset"] = batch2offset(self.batch)
 
         if "bt" not in self.keys() and "batch" in self.keys():
-            self["bt"] = len(torch.bincount(self.tn.squeeze())) * self.batch + self.tn.squeeze()
+            # print("*********", self.tn.squeeze())
+            tn_sq = self.tn.squeeze()
+            # print(f"tn_sq: {tn_sq}")
+            if tn_sq.dim() == 0:  # 如果tn变成了标量，转为1维张量
+                tn_sq = tn_sq.unsqueeze(0)
+                # print("!!unsqueeze")
+            # print("Bincount of tn_sq:", torch.bincount(tn_sq.int()))
+            # print("Batch tensor:", self.batch)
+            self["bt"] = len(torch.bincount(tn_sq.int())) * self.batch + self.tn.squeeze()
+            # print("00000000  self.bt:", self["bt"])
 
     def serialization(self, order="z", depth=None, shuffle_orders=False):
         """

@@ -5,7 +5,7 @@ test_only = False  # test process
 
 seed = None  # train process will init a random seed and record
 save_path = "exp/default"
-num_worker = 16  # total worker in all gpu
+num_worker = 12  # total worker in all gpu
 batch_size = 16  # total batch size in all gpu
 batch_size_val = None  # auto adapt to bs 1 for each gpu
 batch_size_test = None  # auto adapt to bs 1 for each gpu
@@ -25,7 +25,8 @@ hooks = [
     dict(type="CheckpointLoader"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter"),
-    dict(type="SemSegEvaluator"),
+    # dict(type="SemSegEvaluator"),
+    dict(type="PointCloudDenoiseEvaluator"),
     dict(type="CheckpointSaver", save_freq=None),
     dict(type="PreciseEvaluator", test_last=False),
 ]
@@ -34,4 +35,4 @@ hooks = [
 train = dict(type="DefaultTrainer")
 
 # Tester
-test = dict(type="SemSegTester", verbose=True)
+test = dict(type="PointDenoiseTester", verbose=True)

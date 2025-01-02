@@ -80,12 +80,12 @@ echo " =========> RUN TASK <========="
 
 if [ "${WEIGHT}" = "None" ]
 then
-    $PYTHON "$CODE_DIR"/tools/$TRAIN_CODE \
+    $PYTHON -W ignore "$CODE_DIR"/tools/$TRAIN_CODE \
     --config-file "$CONFIG_DIR" \
     --num-gpus "$GPU" \
     --options save_path="$EXP_DIR"
 else
-    $PYTHON "$CODE_DIR"/tools/$TRAIN_CODE \
+    $PYTHON -W ignore "$CODE_DIR"/tools/$TRAIN_CODE \
     --config-file "$CONFIG_DIR" \
     --num-gpus "$GPU" \
     --options save_path="$EXP_DIR" resume="$RESUME" weight="$WEIGHT"

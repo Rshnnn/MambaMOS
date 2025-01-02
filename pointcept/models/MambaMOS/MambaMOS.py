@@ -6,6 +6,7 @@ import torch.nn as nn
 import spconv.pytorch as spconv
 import torch_scatter
 from timm.models.layers import DropPath
+from scipy.spatial import cKDTree
 
 from pointcept.models.builder import MODELS
 from pointcept.models.utils.misc import offset2bincount
@@ -100,7 +101,9 @@ class MotionAwareStateSpaceModelBlock(PointModule):
     @torch.no_grad()
     def get_padding(self, point):
         offset = point.offset
-        bt_bincount = torch.bincount(point.bt)
+        bt = point.bt.int()
+        bt -= bt.min()  # 确保从 0 开始
+        bt_bincount = torch.bincount(bt)
         b_bincount = offset2bincount(offset)
         B = b_bincount.shape[0]
         BT = bt_bincount.shape[0]
@@ -131,7 +134,7 @@ class MotionAwareStateSpaceModelBlock(PointModule):
         sp_inds = point.serialized_order[self.order_index, :]
         sp_inverse = point.serialized_inverse[self.order_index, :]
 
-        n = torch.bincount(point.bt)
+        n = torch.bincount(point.bt.int())
         tn_inds = []
 
         space_bt = point.bt[sp_inds]
@@ -177,7 +180,8 @@ class MotionAwareStateSpaceModelBlock(PointModule):
         C = point.feat.shape[1]
         b_bincount = offset2bincount(point.offset)
         max_bincount = torch.max(b_bincount)
-        tn_max_bincount = torch.max(torch.bincount(point.bt))
+        # print("##############", point.bt)
+        tn_max_bincount = torch.max(torch.bincount(point.bt.int()))
 
         # serialized
         sp_inds, sp_inverse, tn_inds, tn_inverse = self.serialized(point)
@@ -259,6 +263,7 @@ class Block(PointModule):
                 channels,
                 channels,
                 kernel_size=3,
+                padding=5,
                 bias=True,
                 indice_key=cpe_indice_key,
             ),
@@ -324,6 +329,8 @@ class SerializedPooling(PointModule):
         self.stride = stride
         assert reduce in ["sum", "mean", "min", "max"]
         self.reduce = reduce
+
+
         self.shuffle_orders = shuffle_orders
         self.traceable = traceable
 
@@ -345,8 +352,11 @@ class SerializedPooling(PointModule):
         }.issubset(
             point.keys()
         ), "Run point.serialization() point cloud before SerializedPooling"
-
-        code = point.serialized_code >> pooling_depth * 3
+        # print("point.serialized_depth:", point.serialized_depth)
+        if point.serialized_depth > 2:
+            code = point.serialized_code >> pooling_depth
+        else:
+            code = point.serialized_code
         code_, cluster, counts = torch.unique(
             code[0],
             sorted=True,
@@ -359,6 +369,20 @@ class SerializedPooling(PointModule):
         idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
         # head_indices of each cluster, for reduce attr e.g. code, batch
         head_indices = indices[idx_ptr[:-1]]
+
+        def is_hashable(obj):
+            try:
+                hash(obj)
+                return True
+            except TypeError:
+                return False
+
+        if is_hashable(point.segment):
+            tree = cKDTree(point.segment[:, :3].cpu().numpy())
+            dist, idx = tree.query(point.coord[head_indices].cpu().numpy())
+        else:
+            idx = head_indices
+
         # generate down code, order, inverse
         code = code[:, head_indices]
         order = torch.argsort(code)
@@ -385,7 +409,7 @@ class SerializedPooling(PointModule):
                 point.coord[indices], idx_ptr, reduce="mean"
             ),
             grid_coord=point.grid_coord[head_indices] >> pooling_depth,
-            segment=point.segment[head_indices],
+            segment=point.segment[idx],
             serialized_code=code,
             serialized_order=order,
             serialized_inverse=inverse,
@@ -393,6 +417,7 @@ class SerializedPooling(PointModule):
             batch=point.batch[head_indices],
             tn=point.tn[head_indices],
         )
+        # print("#### SerializedPooling point.tn[head_indices]:", point.tn[head_indices])
 
         if "condition" in point.keys():
             point_dict["condition"] = point.condition
@@ -402,6 +427,7 @@ class SerializedPooling(PointModule):
         if self.traceable:
             point_dict["pooling_inverse"] = cluster
             point_dict["pooling_parent"] = point
+        # print("########## SerializedPooling")
         point = Point(point_dict)
         if self.norm is not None:
             point = self.norm(point)
@@ -594,10 +620,16 @@ class MambaMOS(PointModule):
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
     ):
         super().__init__()
+
         self.num_stages = len(enc_depths)
         self.order = [order] if isinstance(order, str) else order
         self.cls_mode = cls_mode
         self.shuffle_orders = shuffle_orders
+
+        stride = [stride] if isinstance(stride, int) else stride
+        enc_depths = [enc_depths] if isinstance(enc_depths, int) else enc_depths
+        dec_depths = [dec_depths] if isinstance(dec_depths, int) else dec_depths
+        dec_channels = [dec_channels] if isinstance(dec_channels, int) else dec_channels
 
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)
@@ -731,8 +763,12 @@ class MambaMOS(PointModule):
         return Point({"sparse_conv_feat": sparse_conv_tn_feat})
 
     def forward(self, data_dict):
+
+        # print("########  backbone")
         point = Point(data_dict)
+        # print("1 point.bt :", point.bt)
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
+
         point.sparsify(wtn=False)
         point_tn = self.get_tn_sparse_feat(point)
 
@@ -740,11 +776,5 @@ class MambaMOS(PointModule):
         point = self.enc(point)
         if not self.cls_mode:
             point = self.dec(point)
-        # else:
-        #     point.feat = torch_scatter.segment_csr(
-        #         src=point.feat,
-        #         indptr=nn.functional.pad(point.offset, (1, 0)),
-        #         reduce="mean",
-        #     )
 
         return point
